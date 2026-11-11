@@ -39,6 +39,7 @@ Installer устанавливает только интеграцию этог�
 обновления системы. Сборка ARM-клиента загружает фиксированные ревизии fbvnc,
 libjpeg-turbo, zlib-ng и официальный Zig с проверкой SHA256 в `.build/`.
 На подготовленном компьютере доступен `./install.sh --user-only`.
+Сборщик рассчитан на Linux x86_64; готовый клиент — ARMv7/musl.
 
 **Boot kit предоставляется отдельно.** В нём должны быть проверенные K94AP
 bootchain/bundle, `.work/kloader`, `.work/cascadia/lib/appleusb.py` и свой
@@ -65,6 +66,10 @@ ipad-monitor stop        # останавливает сервер, не вык�
 Служба: `systemctl --user status ipad2-k94-monitor.service`.
 Поддержка сенсора требует отдельного драйвера контроллера и передачи input
 в Omarchy; текущий kernel не обнаруживает input-устройств планшета.
+
+Ручное повторение замера (покажет 14-секундную анимацию на iPad):
+`.venv/bin/python tools/measure_display.py my-run`. Результат сохраняется
+в локальном state-каталоге и не входит в Git.
 
 ## Авторство
 
