@@ -1,0 +1,570 @@
+diff --git a/devices/a5/dts/k94ap.dts b/devices/a5/dts/k94ap.dts
+new file mode 100644
+index 0000000..9e12f4b
+--- /dev/null
++++ b/devices/a5/dts/k94ap.dts
+@@ -0,0 +1,111 @@
++// SPDX-License-Identifier: GPL-2.0 OR MIT
++// Experimental K94 RAM-console target. MMIO and IRQs matched against K94/12H321 ADT.
++// K94 live iOS confirms VRAM 0x9f6fc000, 1024x768, stride 4096.
++// MPIDR 0x900 is inherited from the same S5L8940 SoC; loader prints the live value.
++/dts-v1/;
++
++/ {
++    model = "Apple iPad 2 GSM (K94AP)";
++    compatible = "apple,k94ap", "apple,s5l8940x", "apple,arm";
++    #address-cells = <1>;
++    #size-cells = <1>;
++    interrupt-parent = <&aic>;
++
++    aliases { serial0 = &uart0; };
++    chosen {
++        bootargs = "earlycon=s3c6400,0x32500000 keep_bootcon console=tty0 maxcpus=1 root=/dev/ram0 rw panic=0 loglevel=8 g_cdc.host_addr=02:94:00:00:00:01 g_cdc.dev_addr=02:94:00:00:00:02";
++    };
++
++    memory@80000000 {
++        device_type = "memory";
++        // Exclude iBoot/framebuffer space above the live vram allocation.
++        reg = <0x80000000 0x1f6fc000>;
++    };
++    reserved-memory {
++        #address-cells = <1>;
++        #size-cells = <1>;
++        ranges;
++        fb_region: framebuffer@9f6fc000 {
++            reg = <0x9f6fc000 0x900000>;
++            no-map;
++        };
++        cpu_reset_page: cpu-reset@80000000 {
++            reg = <0x80000000 0x1000>;
++            no-map;
++        };
++    };
++    framebuffer0: framebuffer@9f6fc000 {
++        compatible = "simple-framebuffer";
++        reg = <0x9f6fc000 0x400000>;
++        width = <1024>;
++        height = <768>;
++        stride = <4096>;
++        format = "a8r8g8b8";
++        memory-region = <&fb_region>;
++    };
++    cpus {
++        #address-cells = <1>;
++        #size-cells = <0>;
++        apple,cpu-reset-page = <&cpu_reset_page>;
++        cpu@900 {
++            device_type = "cpu";
++            compatible = "arm,cortex-a9";
++            reg = <0x900>;
++        };
++    };
++    // Omit L2 enablement for the first console experiment. No storage, power,
++    // GPIO, Wi-Fi or touchscreen nodes are probed in this first-stage DTS.
++    uart_clk: clock-24000000 {
++        compatible = "fixed-clock";
++        #clock-cells = <0>;
++        clock-frequency = <24000000>;
++    };
++    soc@30000000 {
++        compatible = "simple-bus";
++        #address-cells = <1>;
++        #size-cells = <1>;
++        ranges = <0 0x30000000 0x10000000>;
++
++        // Verified on K93; matching K94 stock ADT: free-running 24 MHz counter, single 16-byte bank.
++        // Platform clock code only reads it; RAM-loader reset stays armed.
++        timer@f103020 {
++            compatible = "apple,s5l8940x-wdt-timer";
++            reg = <0xf103020 0x10>;
++        };
++
++        aic: interrupt-controller@f200000 {
++            compatible = "aic,1";
++            reg = <0xf200000 0x10000>;
++            interrupt-controller;
++            #interrupt-cells = <1>;
++            #address-cells = <0>;
++            apple,main-cpus = <2>;
++        };
++        uart0: serial@2500000 {
++            compatible = "apple,s5l-uart";
++            reg = <0x2500000 0x1000>;
++            interrupts = <21>;
++            clocks = <&uart_clk>, <&uart_clk>;
++            clock-names = "uart", "clk_uart_baud0";
++        };
++        otgphy: phy@6000000 {
++            compatible = "apple,s5l8940x-otgphy";
++            reg = <0x6000000 0x1000>, <0xf108000 0x1000>;
++            #phy-cells = <1>;
++            // Matching K93 and K94 stock ADTs. Driver preserves iBoot's live tuning.
++            apple,uotgtune1-device = <0x349>;
++            apple,uotgtune2-device = <0xf13>;
++        };
++        usb@6100000 {
++            compatible = "apple,s5l8940x-dwc2", "snps,dwc2";
++            reg = <0x6100000 0x10000>;
++            interrupts = <11>;
++            phys = <&otgphy 0>;
++            phy-names = "usb2-phy";
++            dr_mode = "peripheral";
++            g-rx-fifo-size = <512>;
++            g-np-tx-fifo-size = <128>;
++            g-tx-fifo-size = <128 128 128 128 128 128 128 128>;
++        };
++    };
++};
+diff --git a/devices/a5/patches/files/arch/arm/mach-apple/Kconfig b/devices/a5/patches/files/arch/arm/mach-apple/Kconfig
+index 63f344f..a0be103 100644
+--- a/devices/a5/patches/files/arch/arm/mach-apple/Kconfig
++++ b/devices/a5/patches/files/arch/arm/mach-apple/Kconfig
+@@ -17,6 +17,7 @@ menuconfig ARCH_APPLE_S5L
+ 	select CLKSRC_MMIO
+ 	select COMMON_CLK
+ 	select GENERIC_IRQ_CHIP
++	select GENERIC_IRQ_IPI_MUX if SMP
+ 	select HAVE_ARM_TWD if SMP
+ 	help
+ 	  Support for Apple's 32-bit ARM application processors, as used in
+diff --git a/devices/a5/scripts/patch-ibec-autogo.py b/devices/a5/scripts/patch-ibec-autogo.py
+index d548c9d..5117efd 100755
+--- a/devices/a5/scripts/patch-ibec-autogo.py
++++ b/devices/a5/scripts/patch-ibec-autogo.py
+@@ -19,7 +19,9 @@ Offsets: iBEC iBoot-2261 P105AP iOS 8.4.1 (image base 0x9ff00000).
+ from __future__ import annotations
+ 
+ import argparse
++import os
+ import re
++import shutil
+ import subprocess
+ import sys
+ import tempfile
+@@ -51,11 +53,13 @@ def _link_bytes(ld: str, asm: str) -> bytes:
+         (root / "patch.S").write_text(asm, encoding="ascii")
+         (root / "patch.ld").write_text(ld, encoding="ascii")
+         elf = root / "patch.elf"
+-        subprocess.run(
+-            [
+-                "arm-linux-gnueabihf-gcc",
+-                "-nostdlib",
+-                "-mthumb",
++        prefix = os.environ.get("CROSS_COMPILE", "arm-linux-gnueabihf-")
++        if shutil.which(prefix + "gcc"):
++            subprocess.run(
++                [
++                    prefix + "gcc",
++                    "-nostdlib",
++                    "-mthumb",
+                 # Ubuntu's gcc enables --build-id by default, and the linker
+                 # then places .note.gnu.build-id at the script's `.` -- exactly
+                 # 36 bytes of it: 12 bytes of note header, "GNU\0", and a
+@@ -66,29 +70,43 @@ def _link_bytes(ld: str, asm: str) -> bytes:
+                 # verify, which is the only reason it was ever noticed.
+                 # build-staging-bundle.sh already links with this for the same
+                 # reason.
+-                "-Wl,--build-id=none",
+-                "-T",
+-                str(root / "patch.ld"),
+-                "-o",
+-                str(elf),
+-                str(root / "patch.S"),
+-            ],
+-            check=True,
+-            capture_output=True,
+-        )
+-        return subprocess.run(
++                    "-Wl,--build-id=none",
++                    "-T",
++                    str(root / "patch.ld"),
++                    "-o",
++                    str(elf),
++                    str(root / "patch.S"),
++                ],
++                check=True,
++                capture_output=True,
++            )
++        else:
++            # Native macOS can assemble/link these freestanding patches with
++            # GNU ARM binutils; it does not need a Linux GCC or sysroot.
++            subprocess.run(
++                [prefix + "as", "-mthumb", "-o", str(root / "patch.o"), str(root / "patch.S")],
++                check=True, capture_output=True,
++            )
++            subprocess.run(
++                [prefix + "ld", "--build-id=none", "-T", str(root / "patch.ld"),
++                 "-o", str(elf), str(root / "patch.o")],
++                check=True, capture_output=True,
++            )
++        binary = root / "patch.bin"
++        subprocess.run(
+             [
+-                "arm-linux-gnueabihf-objcopy",
++                prefix + "objcopy",
+                 "-O",
+                 "binary",
+                 "-j",
+                 ".text",
+                 str(elf),
+-                "/dev/stdout",
++                str(binary),
+             ],
+             check=True,
+             capture_output=True,
+-        ).stdout
++        )
++        return binary.read_bytes()
+ 
+ 
+ def build_hook(base: int) -> bytes:
+diff --git a/devices/a5/tools/k93-build-bootchain.py b/devices/a5/tools/k93-build-bootchain.py
+index b19bd76..c47ae7d 100644
+--- a/devices/a5/tools/k93-build-bootchain.py
++++ b/devices/a5/tools/k93-build-bootchain.py
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env python3
+-"""Build K93/12H321 RAM boot images. Offline only: no USB or storage writes."""
++"""Build K93/K94 12H321 RAM boot images. Offline only; no device access."""
++import argparse
+ import hashlib
+ import importlib.util
+ import json
+@@ -9,17 +10,27 @@ import subprocess
+ import sys
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+-FW = ROOT / 'build/k93/firmware-12H321'
+-OUT = ROOT / 'build/k93/bootchain-v2'
+-PINS = {
++PROFILES = {
++  'k93': {
+     'iBSS': '5f28aa43dba148c1a8ee77fb0d3f065751e3c86139c5ce802b4cb5239389de28',
+     'iBEC': '8c033bd9a90ab80329ae205152337052ca95d87266c2c75fce65fe980b440c4d',
++  },
++  'k94': {
++    'iBSS': '9d30c291c0b8fca156f3ade63b4b22b78e5cbb866d3cb485cea4104ba7e1c1a8',
++    'iBEC': '89017d6b1489cf0cfa1b555021c7b36fcf30ced1d0c73c47c1137cf6f74abdb9',
++  },
+ }
+ 
+ def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--board', choices=PROFILES, default='k93')
++    args = parser.parse_args()
++    board = args.board
++    FW = ROOT / f'build/{board}/firmware-12H321'
++    OUT = ROOT / f'build/{board}/bootchain-v2'
+     OUT.mkdir(parents=True, exist_ok=True)
+-    for name, pin in PINS.items():
+-        src = FW / f'{name}.k93.RELEASE.dfu.dec'
++    for name, pin in PROFILES[board].items():
++        src = FW / f'{name}.{board}.RELEASE.dfu.dec'
+         data = src.read_bytes()
+         if hashlib.sha256(data).hexdigest() != pin:
+             raise SystemExit(f'{name}: incorrect stock firmware')
+@@ -33,7 +44,7 @@ def main():
+     patch.DONE_FLAG = 0x9ff4b2b0
+     patch.USB_CONTINUE = 0x9ff200e0
+     data = bytearray((OUT / 'iBEC.sigpatched').read_bytes())
+-    stock = (FW / 'iBEC.k93.RELEASE.dfu.dec').read_bytes()
++    stock = (FW / f'iBEC.{board}.RELEASE.dfu.dec').read_bytes()
+     # Startup's ARM code copies [base, image_end), then clears [bss_start,
+     # bss_end). File-tail zeros are NOT a code cave: the first experiment put
+     # the trampoline exactly at BSS start and startup erased it. Use only the
+@@ -41,7 +52,7 @@ def main():
+     image_end, text_end, data_start, data_end, bss_start, bss_end = struct.unpack_from('<6I', stock, 0x314)
+     if (image_end, text_end, data_start, data_end, bss_start, bss_end) != (
+             0x9ff46e80, 0x9ff45c74, 0x9ff46000, 0x9ff46e80, 0x9ff46e80, 0x9ff4cd38):
+-        raise SystemExit('Unexpected K93 startup section layout')
++        raise SystemExit(f'Unexpected {board.upper()} startup section layout')
+     cave_start = patch.IBOOT_BASE + patch.TRAMPOLINE_OFF
+     cave_end = cave_start + patch.TRAMPOLINE_MAX
+     if not text_end <= cave_start < cave_end <= data_start <= bss_start:
+@@ -53,9 +64,9 @@ def main():
+     # and continuation, not just the four-byte hook.
+     expected = bytes.fromhex('1a480121017005f10800bde8b040fcf731bd')
+     if stock[0x2366c:0x2367e] != expected:
+-        raise SystemExit('K93 ep4 tail differs from the audited firmware')
++        raise SystemExit(f'{board.upper()} ep4 tail differs from the audited firmware')
+     if struct.unpack_from('<I', stock, 0x236d8)[0] != patch.DONE_FLAG:
+-        raise SystemExit('K93 done flag differs')
++        raise SystemExit(f'{board.upper()} done flag differs')
+     if any(data[patch.TRAMPOLINE_OFF:patch.TRAMPOLINE_OFF+128]):
+         raise SystemExit('Code cave is not zero-filled')
+     info = patch.patch_autogo(data)
+@@ -75,7 +86,7 @@ def main():
+     (OUT / 'iBEC.autogo').write_bytes(data)
+     sys.path.insert(0, str(ROOT / 'scripts'))
+     from img3pack import pack_plain, parse_tags
+-    packed = pack_plain((FW / 'iBEC.k93.RELEASE.dfu').read_bytes(), bytes(data))
++    packed = pack_plain((FW / f'iBEC.{board}.RELEASE.dfu').read_bytes(), bytes(data))
+     if any(tag == b'GABK' for _,tag,_,_ in parse_tags(packed)):
+         raise SystemExit('kDFU iBEC must not contain a KBAG')
+     for off,tag,total,size in parse_tags(packed):
+@@ -84,7 +95,7 @@ def main():
+     (OUT / 'iBEC.autogo.plain.dfu').write_bytes(packed)
+     manifest = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in OUT.iterdir() if p.is_file() and p.name != 'manifest.json'}
+     (OUT / 'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
+-    print('K93 bootchain built and verified offline; hardware boot NOT yet tested')
++    print(f'{board.upper()} bootchain built and verified offline; hardware boot NOT yet tested')
+ 
+ if __name__ == '__main__':
+     main()
+diff --git a/devices/a5/tools/k93-build-bundle.py b/devices/a5/tools/k93-build-bundle.py
+index 86eda0f..5f73a96 100644
+--- a/devices/a5/tools/k93-build-bundle.py
++++ b/devices/a5/tools/k93-build-bundle.py
+@@ -9,6 +9,7 @@ import subprocess
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ parser = argparse.ArgumentParser()
++parser.add_argument('--board', choices=('k93', 'k94'), default='k93')
+ parser.add_argument('--diagnostic', action='store_true', help='Separate K93 build with handoff checkpoints')
+ parser.add_argument('--early-trace', action='store_true', help='Use explicitly built decompressor/kernel trace image (implies diagnostic)')
+ parser.add_argument('--watchdog-seconds', type=int, choices=range(15, 121), metavar='15..120', help='Arm hardware reset for this RAM boot test')
+@@ -18,6 +19,7 @@ parser.add_argument('--init-watchdog', action='store_true', help='Trace C kernel
+ parser.add_argument('--late-watchdog', action='store_true', help='Trace post-console startup and scheduling init')
+ parser.add_argument('--counter-clock', action='store_true', help='V8 late trace with K93 watchdog counter clock enabled')
+ args = parser.parse_args()
++board = args.board
+ if args.counter_clock:
+     args.late_watchdog = True
+ if args.late_watchdog:
+@@ -33,29 +35,29 @@ if args.stage_watchdog:
+     args.watchdog_seconds = 120
+ if args.early_trace:
+     args.diagnostic = True
+-OUT = ROOT / ('build/k93/bundle-diag-v3' if args.early_trace else 'build/k93/bundle-diag-v2' if args.diagnostic else 'build/k93/bundle')
++OUT = ROOT / (f'build/{board}/bundle-diag-v3' if args.early_trace else f'build/{board}/bundle-diag-v2' if args.diagnostic else f'build/{board}/bundle')
+ if args.stage_watchdog:
+-    OUT = ROOT / 'build/k93/bundle-diag-v4'
++    OUT = ROOT / f'build/{board}/bundle-diag-v4'
+ if args.mmu_watchdog:
+-    OUT = ROOT / 'build/k93/bundle-diag-v5'
++    OUT = ROOT / f'build/{board}/bundle-diag-v5'
+ if args.init_watchdog:
+-    OUT = ROOT / 'build/k93/bundle-diag-v6'
++    OUT = ROOT / f'build/{board}/bundle-diag-v6'
+ if args.late_watchdog:
+-    OUT = ROOT / 'build/k93/bundle-diag-v7'
++    OUT = ROOT / f'build/{board}/bundle-diag-v7'
+ if args.counter_clock:
+-    OUT = ROOT / 'build/k93/bundle-diag-v8'
++    OUT = ROOT / f'build/{board}/bundle-diag-v8'
+ if args.watchdog_seconds:
+     OUT = OUT.with_name(OUT.name + f'-wdt{args.watchdog_seconds}')
+ OUT.mkdir(parents=True, exist_ok=True)
+-kernel_dir = ROOT / ('build/k93/kernel-trace' if args.early_trace else 'build/out')
++kernel_dir = ROOT / (f'build/{board}/kernel-trace' if args.early_trace else 'build/out')
+ if args.stage_watchdog:
+-    kernel_dir = ROOT / 'build/k93/kernel-trace-staged'
++    kernel_dir = ROOT / f'build/{board}/kernel-trace-staged'
+ if args.mmu_watchdog:
+-    kernel_dir = ROOT / 'build/k93/kernel-trace-mmu'
++    kernel_dir = ROOT / f'build/{board}/kernel-trace-mmu'
+ if args.init_watchdog:
+-    kernel_dir = ROOT / 'build/k93/kernel-trace-init'
++    kernel_dir = ROOT / f'build/{board}/kernel-trace-init'
+ if args.late_watchdog:
+-    kernel_dir = ROOT / 'build/k93/kernel-trace-late'
++    kernel_dir = ROOT / f'build/{board}/kernel-trace-late'
+ kernel = (kernel_dir / 'zImage').read_bytes()
+ kernel_original_hash = hashlib.sha256(kernel).hexdigest()
+ if struct.unpack_from('<I', kernel, 0x24)[0] != 0x016f2818:
+@@ -78,9 +80,9 @@ config = (kernel_dir / 'kernel-config').read_text()
+ for forbidden in ['CONFIG_MTD=y', 'CONFIG_DRM_APPLE_SGX=y', 'CONFIG_BATTERY_APPLE_HDQ=y']:
+     if forbidden in config.splitlines():
+         raise SystemExit('Unsafe K93 config: ' + forbidden)
+-dts = ROOT / 'dts/k93ap.dts'
+-subprocess.run(['dtc', '-I', 'dts', '-O', 'dtb', '-o', str(OUT / 'k93ap.dtb'), str(dts)], check=True)
+-dtb = (OUT / 'k93ap.dtb').read_bytes()
++dts = ROOT / f'dts/{board}ap.dts'
++subprocess.run(['dtc', '-I', 'dts', '-O', 'dtb', '-o', str(OUT / f'{board}ap.dtb'), str(dts)], check=True)
++dtb = (OUT / f'{board}ap.dtb').read_bytes()
+ if struct.unpack_from('>II', dtb)[0] != 0xd00dfeed or struct.unpack_from('>I', dtb, 4)[0] != len(dtb):
+     raise SystemExit('Invalid DTB')
+ kernel += bytes((-len(kernel)) % 4)
+@@ -88,9 +90,9 @@ dtb_phys = 0x80008000 + len(kernel)
+ (OUT / 'staging-generated.h').write_text(f'#define DTB_PHYS {dtb_phys:#x}u\n#define DTB_SIZE {len(dtb):#x}u\n')
+ # Copy C into the isolated build directory so its quoted generated-header
+ # include cannot resolve to stale P105 output in pongo/.
+-source = (ROOT / 'pongo/linux_boot.c').read_text().replace('P105 linux-boot', 'K93 Linux RAM boot')
++source = (ROOT / 'pongo/linux_boot.c').read_text().replace('P105 linux-boot', f'{board.upper()} Linux RAM boot')
+ if args.diagnostic:
+-    source = (ROOT / 'pongo/k93_linux_boot_diag.c').read_text()
++    source = (ROOT / 'pongo/k93_linux_boot_diag.c').read_text().replace('K93 RAM diagnostic', f'{board.upper()} RAM diagnostic')
+ (OUT / 'linux_boot.c').write_text(source)
+ subprocess.run([
+     'arm-linux-gnueabihf-gcc', '-static', '-nostdlib', '-nostartfiles', '-O2',
+@@ -113,7 +115,7 @@ bundle = loader + bytes(0x8000-len(loader)) + kernel + dtb
+ if 0x80000000 + len(bundle) >= 0x90000000:
+     raise SystemExit('Bundle exceeds reserved lower RAM window')
+ (OUT / 'staging-bundle.bin').write_bytes(bundle)
+-manifest = {'board': 'K93AP', 'dtb_phys': hex(dtb_phys), 'stack_top': '0x80007000', 'watchdog_physical': '0x3f103020', 'files': {}}
++manifest = {'board': board.upper() + 'AP', 'dtb_phys': hex(dtb_phys), 'stack_top': '0x80007000', 'watchdog_physical': '0x3f103020', 'files': {}}
+ if args.watchdog_seconds:
+     manifest['watchdog_timeout_seconds'] = args.watchdog_seconds
+ if args.diagnostic:
+@@ -130,7 +132,7 @@ if args.diagnostic:
+         manifest['diagnostic']['reset_deadlines_seconds'] = {'30': 'C start_kernel entered', '45': 'setup_arch returned', '60': 'scheduler initialized', '75': 'interrupt controller initialized', '90': 'time initialization returned', '105': 'console initialized', '120': 'C entry not reached'}
+     if args.late_watchdog:
+         manifest['diagnostic']['reset_deadlines_seconds'] = {'30': 'post-console panic check passed', '45': 'entering delay calibration', '60': 'delay calibration returned', '75': 'entering rest_init', '90': 'init threads created before first schedule', '105': 'init task reached kernel_init_freeable', '120': 'no late checkpoint reached'}
+-for name in ['linux-boot.bin', 'staging-bundle.bin', 'k93ap.dtb']:
++for name in ['linux-boot.bin', 'staging-bundle.bin', f'{board}ap.dtb']:
+     data = (OUT / name).read_bytes()
+     manifest['files'][name] = {'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
+ (OUT / 'manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+diff --git a/devices/a5/tools/k93-build-kernel-trace.sh b/devices/a5/tools/k93-build-kernel-trace.sh
+index 724caf6..a522327 100644
+--- a/devices/a5/tools/k93-build-kernel-trace.sh
++++ b/devices/a5/tools/k93-build-kernel-trace.sh
+@@ -2,23 +2,25 @@
+ # Run inside the existing cross-toolchain container. Reuse configured RAM root.
+ set -euo pipefail
+ cd "$(dirname "$0")/.."
++BOARD="${BOARD:-k93}"
++case "$BOARD" in k93|k94) ;; *) echo 'Unsupported board'; exit 2 ;; esac
+ TRACE_FLAGS=-DK93_EARLY_TRACE
+-TRACE_OUT=build/k93/kernel-trace
++TRACE_OUT=build/$BOARD/kernel-trace
+ INSTRUMENT_ARGS=()
+ case "${1:-}" in
+     '') ;;
+     --watchdog-stages)
+         TRACE_FLAGS="$TRACE_FLAGS -DK93_WDT_STAGE_TRACE"
+-        TRACE_OUT=build/k93/kernel-trace-staged ;;
++        TRACE_OUT=build/$BOARD/kernel-trace-staged ;;
+     --mmu-stages)
+         TRACE_FLAGS="$TRACE_FLAGS -DK93_WDT_STAGE_TRACE -DK93_MMU_STAGE_TRACE"
+-        TRACE_OUT=build/k93/kernel-trace-mmu ;;
++        TRACE_OUT=build/$BOARD/kernel-trace-mmu ;;
+     --init-stages|--late-stages)
+         TRACE_FLAGS="$TRACE_FLAGS -DK93_WDT_STAGE_TRACE -DK93_MMU_STAGE_TRACE -DK93_INIT_STAGE_TRACE"
+-        TRACE_OUT=build/k93/kernel-trace-init
++        TRACE_OUT=build/$BOARD/kernel-trace-init
+         INSTRUMENT_ARGS=("$1")
+         if [[ "$1" == --late-stages ]]; then
+-            TRACE_OUT=build/k93/kernel-trace-late
++            TRACE_OUT=build/$BOARD/kernel-trace-late
+         fi ;;
+     *) echo 'Unknown trace build option'; exit 2 ;;
+ esac
+@@ -35,8 +37,8 @@ assert 'CONFIG_KASAN=y' not in c, 'Diagnostic watchdog mapping needs non-KASAN c
+ PY
+ python3 tools/k93-instrument-kernel.py "${INSTRUMENT_ARGS[@]}"
+ make -C build/linux ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
+-    KAFLAGS="$TRACE_FLAGS" -j8 zImage
++    KAFLAGS="$TRACE_FLAGS" -j"${JOBS:-2}" zImage
+ mkdir -p "$TRACE_OUT"
+ cp build/linux/arch/arm/boot/zImage "$TRACE_OUT/zImage"
+ cp build/linux/.config "$TRACE_OUT/kernel-config"
+-echo 'K93 early-trace kernel built; not hardware-tested'
++echo "$BOARD early-trace kernel built; not hardware-tested"
+diff --git a/devices/a5/tools/k93-extract-firmware.py b/devices/a5/tools/k93-extract-firmware.py
+index 9e00488..348836e 100644
+--- a/devices/a5/tools/k93-extract-firmware.py
++++ b/devices/a5/tools/k93-extract-firmware.py
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env python3
+ """Extract public stock K93 firmware for offline analysis; never contacts USB."""
+ from pathlib import Path
++import argparse
+ import hashlib
+ import json
+ import sys
+@@ -15,18 +16,27 @@ from dtparse import parse_node
+ 
+ # Public firmware decryption material, not device/user credentials.
+ # https://theapplewiki.com/wiki/Keys:Donner_12H321_(iPad2,1)
+-PARTS = {
++PROFILES = {'k93': {
+     'DeviceTree.k93ap.img3': ('5bffad9ad82108c5ae3d38150dc56aea', '12433a4c85ec86ac6e14884f01661e2c5de43adee0323d1e88d4edd8d1ae9fda'),
+     'iBSS.k93.RELEASE.dfu': ('781b9672a86ba1b41f8b7fa0af714c94', 'bbd7bf676dbcc6ba93c76d496b7af39ae7772eaaad2ec9fb71dc1fd004827784'),
+     'iBEC.k93.RELEASE.dfu': ('83220a369c9525f3febb3edd331c65fb', '179027ef30b5008882d6dbd723ceb50c39cba40bb33ba620b71bcbc53ff2d424'),
+-}
++}, 'k94': {
++    'DeviceTree.k94ap.img3': ('31eafb5f2872333f49c391407533b913', '2340ba7b12093ebe1c4f9ad6adefb78b8aa5df718f63f4671dbc882cc657abfe'),
++    'iBSS.k94.RELEASE.dfu': ('883c92ed915e4d2481570a062583495b', 'ccfadf3732904885d38f963cce035d7e03b387b67212d526503c85773b58e52f'),
++    'iBEC.k94.RELEASE.dfu': ('57fba54b264b0911d3329de2231bd4b8', 'e7677abd8b4cef14f9f75e02dec7fdbb0cc1ecc0707fb51367a783e4eeea731e'),
++}}
+ 
+ def main():
+-    out = ROOT / 'build/k93/firmware-12H321'
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('--board', choices=PROFILES, default='k93')
++    parser.add_argument('--ipsw', type=Path)
++    args = parser.parse_args()
++    model = 'iPad2,1' if args.board == 'k93' else 'iPad2,2'
++    out = ROOT / f'build/{args.board}/firmware-12H321'
+     out.mkdir(parents=True, exist_ok=True)
+     records = {}
+-    with zipfile.ZipFile(ROOT / 'iPad2,1_8.4.1_12H321_Restore.ipsw') as archive:
+-        for name, (iv, key) in PARTS.items():
++    with zipfile.ZipFile(args.ipsw or ROOT / f'{model}_8.4.1_12H321_Restore.ipsw') as archive:
++        for name, (iv, key) in PROFILES[args.board].items():
+             entries = [n for n in archive.namelist() if Path(n).name == name]
+             if len(entries) != 1:
+                 raise RuntimeError(f'Expected exactly one {name}')
+@@ -38,10 +48,10 @@ def main():
+                 if end != len(plain):
+                     raise RuntimeError('DeviceTree has unexpected trailing bytes')
+                 props = node['props']
+-                model = props.get('model', b'').rstrip(b'\0').decode()
+-                if model != 'iPad2,1':
+-                    raise RuntimeError(f'Unexpected board {model!r}')
+-                print(f'Validated Apple DeviceTree: {model}, {end} bytes')
++                actual = props.get('model', b'').rstrip(b'\0').decode()
++                if actual != model:
++                    raise RuntimeError(f'Unexpected board {actual!r}')
++                print(f'Validated Apple DeviceTree: {actual}, {end} bytes')
+             (out / name).write_bytes(raw)
+             (out / (name + '.dec')).write_bytes(plain)
+             records[name] = {'archive_member': entries[0], 'size': len(plain), 'sha256': hashlib.sha256(plain).hexdigest()}
+diff --git a/devices/a5/tools/k93-prepare-root.py b/devices/a5/tools/k93-prepare-root.py
+index d2d445d..efa9f5c 100644
+--- a/devices/a5/tools/k93-prepare-root.py
++++ b/devices/a5/tools/k93-prepare-root.py
+@@ -1,5 +1,6 @@
+ #!/usr/bin/env python3
+ """Prepare isolated, RAM-only K93 bring-up inputs; never touches the device."""
++import argparse
+ import hashlib
+ import io
+ import pathlib
+@@ -9,7 +10,10 @@ import tarfile
+ import urllib.request
+ 
+ ROOT = pathlib.Path(__file__).resolve().parents[1]
+-OUT = ROOT / 'build/k93'
++parser = argparse.ArgumentParser(description=__doc__)
++parser.add_argument('--board', choices=('k93', 'k94'), default='k93')
++args = parser.parse_args()
++OUT = ROOT / f'build/{args.board}'
+ OUT.mkdir(parents=True, exist_ok=True)
+ url = 'https://dl-cdn.alpinelinux.org/alpine/v3.23/main/armv7/busybox-static-1.37.0-r30.apk'
+ apk = OUT / 'busybox-static-1.37.0-r30.apk'
+@@ -43,15 +47,18 @@ for applet in ['sh', 'mount', 'mkdir', 'setsid', 'uname', 'sleep', 'ls', 'cat',
+     path = rootfs / 'bin' / applet
+     if not path.is_symlink():
+         path.symlink_to('busybox')
+-shutil.copyfile(ROOT / 'rootfs/k93/init', rootfs / 'init')
++(rootfs / 'init').write_text((ROOT / 'rootfs/k93/init').read_text().replace('K93', args.board.upper()))
+ (rootfs / 'init').chmod(0o755)
+ # Preserve upstream trim/dependencies while disabling unverified peripherals.
+-disabled = set('MTD MTD_APPLE_H2FMI DRM_APPLE_SGX BATTERY_APPLE_HDQ BACKLIGHT_APPLE_PMU_WLED MFD_APPLE_PMU_I2C REGULATOR_APPLE_PMU_PWRSW TOUCHSCREEN_APPLE_Z2 USB_EHCI_HCD USB_EHCI_HCD_PLATFORM BRCMFMAC BRCMFMAC_USB BT BLK_DEV_NBD HFSPLUS_FS'.split())
+-lines = ['# Generated K93 RAM-only config from the pinned upstream P105 fragment.']
++disabled = set('MTD MTD_APPLE_H2FMI DRM_APPLE_SGX BATTERY_APPLE_HDQ BACKLIGHT_APPLE_PMU_WLED MFD_APPLE_PMU_I2C REGULATOR_APPLE_PMU_PWRSW TOUCHSCREEN_APPLE_Z2 USB_EHCI_HCD USB_EHCI_HCD_PLATFORM BRCMFMAC BRCMFMAC_USB BT BLK_DEV_NBD HFSPLUS_FS THUMB2_KERNEL KASAN'.split())
++lines = [f'# Generated {args.board.upper()} RAM-only config from the pinned upstream P105 fragment.']
+ for line in (ROOT / 'config/p105ap.config').read_text().splitlines():
+     match = re.match(r'CONFIG_(\w+)=', line)
+     if match and match[1] in disabled:
+         line = f'# CONFIG_{match[1]} is not set'
+     lines.append(line)
+-(OUT / 'k93.config').write_text('\n'.join(lines) + '\n')
+-print('Prepared', rootfs, 'and', OUT / 'k93.config')
++for symbol in ('THUMB2_KERNEL', 'KASAN'):
++    if not any(re.match(rf'(?:# )?CONFIG_{symbol}(?:=| is not set)', line) for line in lines):
++        lines.append(f'# CONFIG_{symbol} is not set')
++(OUT / f'{args.board}.config').write_text('\n'.join(lines) + '\n')
++print('Prepared', rootfs, 'and', OUT / f'{args.board}.config')

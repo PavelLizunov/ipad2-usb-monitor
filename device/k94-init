@@ -1,0 +1,36 @@
+#!/bin/sh
+export PATH=/bin:/sbin
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs dev /dev
+mkdir -p /dev/pts /run /tmp
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+echo 'K94 Linux RAM boot: userspace reached' >/dev/tty0
+uname -a >/dev/tty0
+
+# A second diagnostic channel avoids macOS CDC-ACM open/control hangs.
+# IPv6 link-local addressing needs no administrator changes on the Mac.
+/bin/busybox ifconfig usb0 10.94.0.2 netmask 255.255.255.252 up
+sleep 2
+{
+    echo K94_USERSPACE_REACHED
+    uname -a
+    cat /proc/device-tree/model
+    echo
+    cat /proc/mounts
+    /bin/busybox ifconfig usb0
+    cat /sys/class/graphics/fb0/virtual_size
+    cat /sys/class/graphics/fb0/bits_per_pixel
+    dmesg | /bin/busybox tail -80
+} >/run/k94-status.txt
+/bin/k94-http-diag >/run/k94-http.log 2>&1 &
+echo 'K94 diagnostics: USB IPv6, port 18994' >/dev/tty0
+
+while :; do
+    if [ -c /dev/ttyGS0 ]; then
+        setsid sh -c 'echo K94_USB_SHELL_READY; uname -a; exec sh' </dev/ttyGS0 >/dev/ttyGS0 2>&1
+    fi
+    sleep 1
+done

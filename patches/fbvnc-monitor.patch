@@ -1,0 +1,468 @@
+diff --git i/fbvnc.c w/fbvnc.c
+index 4103a68..54c5bd7 100644
+--- i/fbvnc.c
++++ w/fbvnc.c
+@@ -29,11 +29,16 @@
+ #include <termios.h>
+ #include <unistd.h>
+ #include <signal.h>
++#include <time.h>
++#ifdef __ARM_NEON
++#include <arm_neon.h>
++#endif
+ #include <sys/socket.h>
+ #include <sys/stat.h>
+ #include <sys/types.h>
+ #include <linux/input.h>
+ #include <zlib.h>
++#include <turbojpeg.h>
+ #include "draw.h"
+ #include "vnc.h"
+ 
+@@ -55,6 +60,47 @@ static int nodraw;		/* do not draw anything */
+ static int nodraw_ref;		/* pending screen redraw */
+ static long vnc_nr;		/* number of bytes received */
+ static long vnc_nw;		/* number of bytes sent */
++static int jpeg_quality = 8;
++static int performance;
++static int adaptive;
++static int requested_encoding;
++static int rotation;
++static u32 *transformed;
++static int *xmap, *ymap;
++static double frame_wall, frame_cpu, frame_draw;
++static unsigned char socket_buffer[65536];
++static int socket_pos, socket_size;
++
++static double timestamp(clockid_t clock)
++{
++	struct timespec t;
++	clock_gettime(clock, &t);
++	return t.tv_sec + t.tv_nsec * 1e-9;
++}
++
++static void frame_stats(void)
++{
++	static double begin, cpu, drawing, handling;
++	static long frames, bytes;
++	double now = timestamp(CLOCK_MONOTONIC);
++	if (!begin) { begin = now; bytes = vnc_nr; }
++	cpu += timestamp(CLOCK_PROCESS_CPUTIME_ID) - frame_cpu;
++	drawing += frame_draw;
++	handling += now - frame_wall;
++	frames++;
++	if (now - begin >= 1.0) {
++		FILE *f = fopen("/run/k94-vnc-perf", "w");
++		if (f) {
++			fprintf(f, "fps=%.2f cpu_ms=%.2f blit_ms=%.2f frame_ms=%.2f mbps=%.2f uptime=%.2f\n",
++				frames / (now - begin), 1000 * cpu / frames,
++				1000 * drawing / frames, 1000 * handling / frames,
++				8e-6 * (vnc_nr - bytes) / (now - begin), now);
++			fclose(f);
++		}
++		begin = now; bytes = vnc_nr; frames = 0;
++		cpu = drawing = handling = 0;
++	}
++}
+ static char *rfb;		/* remote framebuffer contents */
+ static char *icut;		/* incoming cut text file */
+ static char *ocut;		/* outgoing cut text file */
+@@ -69,13 +115,39 @@ static char *z_out;
+ static int z_outlen;
+ static int z_outsize;
+ static int z_outpos;
++static z_stream tight_streams[4];
++static int tight_ready[4];
++static tjhandle jpeg_decoder;
++static int vread(int fd, void *buf, long len);
++
++static int compact_size(int fd)
++{
++	int result = 0;
++	u8 byte;
++	for (int i = 0; i < 3; i++) {
++		if (vread(fd, &byte, 1) < 0) return -1;
++		result |= (byte & (i == 2 ? 255 : 127)) << (7 * i);
++		if (i == 2 || !(byte & 128)) return result;
++	}
++	return -1;
++}
+ 
+ static int vread(int fd, void *buf, long len)
+ {
+ 	long nr = 0;
+-	long n;
+-	while (nr < len && (n = read(fd, buf + nr, len - nr)) > 0)
+-		nr += n;
++	while (nr < len) {
++		if (socket_pos == socket_size) {
++			ssize_t got;
++			do { got = read(fd, socket_buffer, sizeof(socket_buffer)); }
++			while (got < 0 && errno == EINTR);
++			if (got <= 0) break;
++			socket_pos = 0; socket_size = got;
++		}
++		long count = MIN(len - nr, socket_size - socket_pos);
++		memcpy((char *)buf + nr, socket_buffer + socket_pos, count);
++		socket_pos += count;
++		nr += count;
++	}
+ 	vnc_nr += nr;
+ 	if (nr < len)
+ 		fprintf(stderr, "fbvnc: partial vnc read!\n");
+@@ -188,6 +260,19 @@ static void fbmode_bits(int *rr, int *rg, int *rb)
+ 	*rb = (mode >> 0) & 0xf;
+ }
+ 
++static int set_encoding(int fd, int quality)
++{
++	struct vnc_setencoding command;
++	u32 encs[] = {htonl(VNC_ENC_TIGHT), htonl(VNC_ENC_ZRLE), htonl(VNC_ENC_ZLIB),
++		htonl(VNC_ENC_RRE), htonl(VNC_ENC_RAW), htonl((u32)(-32 + quality))};
++	if (requested_encoding >= 0) encs[0] = htonl(requested_encoding);
++	command.type = VNC_SETENCODING;
++	command.pad = 0;
++	command.n = htons(LEN(encs) - (quality == 10));
++	if (vwrite(fd, &command, sizeof(command)) < 0) return -1;
++	return vwrite(fd, encs, ntohs(command.n) * sizeof(encs[0])) < 0 ? -1 : 0;
++}
++
+ static int vnc_init(int fd, int enc)
+ {
+ 	char buf[256];
+@@ -196,8 +281,6 @@ static int vnc_init(int fd, int enc)
+ 	struct vnc_clientinit clientinit;
+ 	struct vnc_serverinit serverinit;
+ 	struct vnc_setpixelformat pixfmt_cmd;
+-	struct vnc_setencoding enc_cmd;
+-	u32 encs[] = {htonl(VNC_ENC_ZRLE), htonl(VNC_ENC_ZLIB), htonl(VNC_ENC_RRE), htonl(VNC_ENC_RAW)};
+ 	int connstat = VNC_CONN_FAILED;
+ 
+ 	/* handshake */
+@@ -218,9 +301,20 @@ static int vnc_init(int fd, int enc)
+ 	srv_cols = ntohs(serverinit.w);
+ 	srv_rows = ntohs(serverinit.h);
+ 
+-	cols = MIN(srv_cols, fb_cols());
+-	rows = MIN(srv_rows, fb_rows());
++	cols = srv_cols;
++	rows = srv_rows;
+ 	bpp = FBM_BPP(fb_mode());
++	if (rotation || srv_cols != fb_cols() || srv_rows != fb_rows()) {
++		if (bpp != 4) return -1;
++		int width = rotation % 2 ? fb_rows() : fb_cols();
++		int height = rotation % 2 ? fb_cols() : fb_rows();
++		xmap = malloc(width * sizeof(*xmap));
++		ymap = malloc(height * sizeof(*ymap));
++		transformed = calloc(fb_rows() * fb_cols(), sizeof(*transformed));
++		if (!xmap || !ymap || !transformed) return -1;
++		for (int x = 0; x < width; x++) xmap[x] = x * srv_cols / width;
++		for (int y = 0; y < height; y++) ymap[y] = y * srv_rows / height;
++	}
+ 	mr = rows / 2;
+ 	mc = cols / 2;
+ 
+@@ -231,6 +325,7 @@ static int vnc_init(int fd, int enc)
+ 	pixfmt_cmd.format.bigendian = 0;
+ 	pixfmt_cmd.format.truecolor = 1;
+ 	fbmode_bits(&rr, &rg, &rb);
++	pixfmt_cmd.format.depth = rr + rg + rb;
+ 	pixfmt_cmd.format.rmax = htons((1 << rr) - 1);
+ 	pixfmt_cmd.format.gmax = htons((1 << rg) - 1);
+ 	pixfmt_cmd.format.bmax = htons((1 << rb) - 1);
+@@ -241,15 +336,8 @@ static int vnc_init(int fd, int enc)
+ 	pixfmt_cmd.format.bshl = 0;
+ 	vwrite(fd, &pixfmt_cmd, sizeof(pixfmt_cmd));
+ 
+-	/* send pixel format */
+-	enc_cmd.type = VNC_SETENCODING;
+-	enc_cmd.pad = 0;
+-	if (enc >= 0)
+-		encs[0] = htonl(enc);
+-	enc_cmd.n = htons(LEN(encs));
+-	vwrite(fd, &enc_cmd, sizeof(enc_cmd));
+-	vwrite(fd, encs, ntohs(enc_cmd.n) * sizeof(encs[0]));
+-	return 0;
++	requested_encoding = enc;
++	return set_encoding(fd, jpeg_quality);
+ }
+ 
+ static int vnc_refresh(int fd, int inc)
+@@ -276,6 +364,45 @@ static void drawfb(int c, int r, int w, int h)
+ 	int ec = MIN(c + w, MIN(srv_cols, oc + cols));
+ 	int er = MIN(r + h, MIN(srv_rows, or + rows));
+ 	int i;
++	if (bc >= ec || br >= er) return;
++	if (transformed) {
++		int width = fb_cols(), height = fb_rows();
++		int lw = rotation % 2 ? height : width;
++		int lh = rotation % 2 ? width : height;
++		int lx1 = bc * lw / srv_cols, lx2 = (ec * lw + srv_cols - 1) / srv_cols;
++		int ly1 = br * lh / srv_rows, ly2 = (er * lh + srv_rows - 1) / srv_rows;
++		int x1, x2, y1, y2;
++		switch (rotation) {
++		case 1: x1 = width - ly2; x2 = width - ly1; y1 = lx1; y2 = lx2; break;
++		case 2: x1 = width - lx2; x2 = width - lx1; y1 = height - ly2; y2 = height - ly1; break;
++		case 3: x1 = ly1; x2 = ly2; y1 = height - lx2; y2 = height - lx1; break;
++		default: x1 = lx1; x2 = lx2; y1 = ly1; y2 = ly2; break;
++		}
++		if (rotation == 0) {
++			for (int y = y1; y < y2; y++) {
++				const u32 *src = (const u32 *)RFB(0, ymap[y]);
++				u32 *dst = fb_mem(y);
++				for (int x = x1; x < x2; x++) dst[x] = src[xmap[x]];
++			}
++			return;
++		}
++		for (int by = y1; by < y2; by += 8)
++			for (int bx = x1; bx < x2; bx += 8)
++				for (int y = by; y < MIN(by + 8, y2); y++)
++					for (int x = bx; x < MIN(bx + 8, x2); x++) {
++						int lx, ly;
++						switch (rotation) {
++						case 1: lx = y; ly = width - 1 - x; break;
++						case 2: lx = width - 1 - x; ly = height - 1 - y; break;
++						case 3: lx = height - 1 - y; ly = x; break;
++						default: lx = x; ly = y; break;
++						}
++						transformed[y * width + x] = *(u32 *)RFB(xmap[lx], ymap[ly]);
++					}
++		for (int y = y1; y < y2; y++)
++			fb_set(y, x1, transformed + y * width + x1, x2 - x1);
++		return;
++	}
+ 	if (bc < ec) {
+ 		for (i = br; i < er; i++)
+ 			fb_set(i - or, bc - oc, RFB(bc, i), ec - bc);
+@@ -293,6 +420,92 @@ static void fillrect(char *pixel, int x, int y, int w, int h)
+ 		memcpy(RFB(x, y + i), RFB(x, y), w * bpp);
+ }
+ 
++static int readtight(int fd, int x, int y, int w, int h)
++{
++	u8 control;
++	if (bpp != 4 || vread(fd, &control, 1) < 0) return -1;
++	for (int i = 0; i < 4; i++)
++		if ((control & (1 << i)) && tight_ready[i])
++			inflateReset(&tight_streams[i]);
++	int type = control >> 4;
++	if (type == 8) {
++		u8 rgb[3], pixel[4];
++		if (vread(fd, rgb, 3) < 0) return -1;
++		pixel[0] = rgb[2]; pixel[1] = rgb[1]; pixel[2] = rgb[0]; pixel[3] = 255;
++		fillrect((char *)pixel, x, y, w, h);
++		return 0;
++	}
++	if (type == 9) {
++		int length = compact_size(fd), width, height, subsampling, colorspace;
++		if (length <= 0 || length > w * h * 4 + 65536) return -1;
++		unsigned char *data = malloc(length);
++		if (!data) return -1;
++		int result = -1;
++		if (vread(fd, data, length) < 0) goto jpeg_done;
++		if (!jpeg_decoder) jpeg_decoder = tjInitDecompress();
++		if (!jpeg_decoder || tjDecompressHeader3(jpeg_decoder, data, length,
++			&width, &height, &subsampling, &colorspace) < 0 || width != w || height != h)
++			goto jpeg_done;
++		result = tjDecompress2(jpeg_decoder, data, length,
++			(unsigned char *)RFB(x, y), w, srv_cols * bpp, h,
++			TJPF_BGRA, TJFLAG_FASTDCT | TJFLAG_FASTUPSAMPLE);
++	jpeg_done:
++		free(data);
++		return result;
++	}
++	if (type > 7) return -1;
++	if (type & 4) {
++		u8 filter;
++		if (vread(fd, &filter, 1) < 0 || filter != 0) return -1;
++	}
++	int size = w * h * 3;
++	unsigned char *pixels = malloc(size + 1);
++	if (!pixels) return -1;
++	int result = -1;
++	if (size < 12) {
++		if (vread(fd, pixels, size) < 0) goto basic_done;
++	} else {
++		int length = compact_size(fd), index = type & 3;
++		if (length <= 0 || length > size + 65536) goto basic_done;
++		unsigned char *compressed = malloc(length);
++		if (!compressed) goto basic_done;
++		if (vread(fd, compressed, length) < 0) { free(compressed); goto basic_done; }
++		z_stream *stream = &tight_streams[index];
++		if (!tight_ready[index]) {
++			if (inflateInit(stream) != Z_OK) { free(compressed); goto basic_done; }
++			tight_ready[index] = 1;
++		}
++		stream->next_in = compressed; stream->avail_in = length;
++		stream->next_out = pixels; stream->avail_out = size + 1;
++		int status = inflate(stream, Z_SYNC_FLUSH);
++		int valid = (status == Z_OK || status == Z_BUF_ERROR) &&
++			stream->avail_in == 0 && stream->avail_out == 1;
++		free(compressed);
++		if (!valid) goto basic_done;
++	}
++	unsigned char *src = pixels;
++	for (int row = 0; row < h; row++) {
++		unsigned char *dst = (unsigned char *)RFB(x, y + row);
++		int col = 0;
++#ifdef __ARM_NEON
++		for (; col + 16 <= w; col += 16, src += 48, dst += 64) {
++			uint8x16x3_t rgb = vld3q_u8(src);
++			uint8x16x4_t bgra;
++			bgra.val[0] = rgb.val[2]; bgra.val[1] = rgb.val[1];
++			bgra.val[2] = rgb.val[0]; bgra.val[3] = vdupq_n_u8(255);
++			vst4q_u8(dst, bgra);
++		}
++#endif
++		for (; col < w; col++, src += 3, dst += 4) {
++			dst[0] = src[2]; dst[1] = src[1]; dst[2] = src[0]; dst[3] = 255;
++		}
++	}
++	result = 0;
++basic_done:
++	free(pixels);
++	return result;
++}
++
+ static int readzrle(int x, int y, int w, int h)
+ {
+ 	char pixel[8] = {0};
+@@ -438,8 +651,13 @@ static int readrect(int fd)
+ 		if (readzrle(x, y, w, h))
+ 			return -1;
+ 	}
+-	if (!nodraw)
++	if (uprect.enc == htonl(VNC_ENC_TIGHT) && readtight(fd, x, y, w, h))
++		return -1;
++	if (!nodraw) {
++		double start = performance ? timestamp(CLOCK_MONOTONIC) : 0;
+ 		drawfb(x, y, w, h);
++		if (performance) frame_draw += timestamp(CLOCK_MONOTONIC) - start;
++	}
+ 	return 0;
+ }
+ 
+@@ -484,12 +702,18 @@ static int vnc_event(int fd)
+ 		return -1;
+ 	switch (msg[0]) {
+ 	case VNC_UPDATE:
++		if (performance) {
++			frame_wall = timestamp(CLOCK_MONOTONIC);
++			frame_cpu = timestamp(CLOCK_PROCESS_CPUTIME_ID);
++			frame_draw = 0;
++		}
+ 		vread(fd, msg + 1, sizeof(*fbup) - 1);
+ 		n = ntohs(fbup->n);
+ 		for (i = 0; i < n; i++)
+ 			if (readrect(fd))
+ 				return -1;
+-		break;
++		if (n && performance) frame_stats();
++		return 1;
+ 	case VNC_BELL:
+ 		break;
+ 	case VNC_SERVERCUTTEXT:
+@@ -735,7 +959,8 @@ static void term_cleanup(struct termios *ti)
+ static void mainloop(int vnc_fd, int kbd_fd, int rat_fd)
+ {
+ 	struct pollfd ufds[3];
+-	int pending = 0;
++	int pending = 1, clean = 0, cleanup_pending = 0;
++	double last_update = timestamp(CLOCK_MONOTONIC);
+ 	int err;
+ 	ufds[0].fd = kbd_fd;
+ 	ufds[0].events = POLLIN;
+@@ -747,18 +972,32 @@ static void mainloop(int vnc_fd, int kbd_fd, int rat_fd)
+ 	if (vnc_refresh(vnc_fd, 0))
+ 		return;
+ 	while (1) {
+-		err = poll(ufds, 3, 500);
++		err = poll(ufds, 3, socket_pos < socket_size ? 0 : (adaptive ? 50 : 500));
+ 		if (err == -1 && errno != EINTR)
+ 			break;
+-		if (!err)
++		if (!err && socket_pos == socket_size) {
++			if (adaptive && !clean && !nodraw && timestamp(CLOCK_MONOTONIC) - last_update > .3) {
++				if (set_encoding(vnc_fd, 10) || vnc_refresh(vnc_fd, 0)) break;
++				pending++; clean = 1; cleanup_pending = 1;
++			}
+ 			continue;
++		}
+ 		if (ufds[0].revents & POLLIN)
+ 			if (kbd_event(vnc_fd, kbd_fd) == -1)
+ 				break;
+-		if (ufds[1].revents & POLLIN) {
+-			if (vnc_event(vnc_fd) == -1)
++		if ((ufds[1].revents & POLLIN) || socket_pos < socket_size) {
++			int updated = vnc_event(vnc_fd);
++			if (updated == -1)
+ 				break;
+-			pending = 0;
++			if (updated) {
++				if (pending) pending--;
++				last_update = timestamp(CLOCK_MONOTONIC);
++				if (cleanup_pending) cleanup_pending = 0;
++				else if (adaptive && clean) {
++					if (set_encoding(vnc_fd, jpeg_quality)) break;
++					clean = 0;
++				}
++			}
+ 		}
+ 		if (ufds[2].revents & POLLIN)
+ 			if (rat_event(vnc_fd, rat_fd) == -1)
+@@ -767,9 +1006,10 @@ static void mainloop(int vnc_fd, int kbd_fd, int rat_fd)
+ 			nodraw_ref = 0;
+ 			drawfb(oc, or, cols, rows);
+ 		}
+-		if (!pending++)
+-			if (vnc_refresh(vnc_fd, 1))
+-				break;
++		if (!pending) {
++			if (vnc_refresh(vnc_fd, 1)) break;
++			pending = 1;
++		}
+ 	}
+ }
+ 
+@@ -784,6 +1024,7 @@ static void signalreceived(int sig)
+ 
+ int main(int argc, char * argv[])
+ {
++	performance = getenv("K94_VNC_PERF") != NULL;
+ 	char buf[256];
+ 	char *port = VNC_PORT;
+ 	char *host = "127.0.0.1";
+@@ -796,12 +1037,23 @@ int main(int argc, char * argv[])
+ 		case 'e':
+ 			enc = atoi(argv[i][2] ? argv[i] + 2 : argv[++i]);
+ 			break;
++		case 'q':
++			jpeg_quality = atoi(argv[i][2] ? argv[i] + 2 : argv[++i]);
++			if (jpeg_quality < 0 || jpeg_quality > 10) return 1;
++			break;
++		case 'r':
++			rotation = atoi(argv[i][2] ? argv[i] + 2 : argv[++i]);
++			if (rotation < 0 || rotation > 3) return 1;
++			break;
+ 		case 'i':
+ 			icut = argv[i][2] ? argv[i] + 2 : argv[++i];
+ 			break;
+ 		case 'o':
+ 			ocut = argv[i][2] ? argv[i] + 2 : argv[++i];
+ 			break;
++		case 'A':
++			adaptive = 1;
++			break;
+ 		case 'a':
+ 			lock_key[0] = (unsigned char) (argv[i][2] ? argv[i][2] : argv[++i][0]);
+ 			break;
+@@ -820,6 +1072,9 @@ int main(int argc, char * argv[])
+ 			printf("  -i path   incoming cut text file\n");
+ 			printf("  -o path   outgoing cut text file\n");
+ 			printf("  -e enc    RFB encoding (0: raw, 2: rre, 6: zlib, 16: zrle)\n");
++			printf("  -q level  Tight JPEG quality, 0..9; 10 is lossless (default 8)\n");
++			printf("  -r turns  clockwise quarter turns, 0..3\n");
++			printf("  -A        restore lossless image after 300ms without updates\n");
+ 			printf("  -a key    alt lock key\n");
+ 			printf("  -c key    control lock key\n");
+ 			printf("  -s key    shift lock key\n");

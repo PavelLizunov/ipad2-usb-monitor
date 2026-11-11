@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+task_entry=$(readlink -f "$0")
+cd "$(dirname "$task_entry")"
+exec .venv/bin/python -m ipad_usb_monitor "$@"

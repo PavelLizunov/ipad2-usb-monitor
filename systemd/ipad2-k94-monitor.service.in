@@ -1,0 +1,17 @@
+[Unit]
+Description=iPad 2 USB monitor for the Omarchy desktop
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+WorkingDirectory=@ROOT@
+ExecStartPre=@PYTHON@ -m ipad_usb_monitor.output
+ExecStart=/usr/bin/wayvnc -C @ROOT@/systemd/wayvnc.conf -S %t/ipad2-k94-wayvncctl -o IPAD2 -d -R -r -f 60 -L info
+Restart=always
+RestartSec=5
+TimeoutStartSec=75
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,14 @@
+#!/bin/sh
+echo $$ >/run/fbvnc-monitor.pid
+trap 'test -z "$viewer" || kill "$viewer" 2>/dev/null; exit' TERM INT
+while :; do
+    . /run/k94-viewer-options
+    if test -f /run/k94-profile; then export K94_VNC_PERF=1; else unset K94_VNC_PERF; fi
+    set -- -e 7 -q "$quality" -r "$rotation"
+    if test "$adaptive" = 1; then set -- "$@" -A; fi
+    /run/fbvnc "$@" 10.94.0.1 5904 </dev/tty1 >/run/fbvnc.log 2>&1 &
+    viewer=$!
+    wait "$viewer"
+    viewer=
+    sleep 2
+done
